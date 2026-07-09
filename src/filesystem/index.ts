@@ -100,7 +100,12 @@ const ReadTextFileArgsSchema = z.object({
 });
 
 const ReadMediaFileArgsSchema = z.object({
-  path: z.string()
+  path: z.string(),
+  // Optional image resizing options:
+  maxWidth: z.number().int().positive().optional().describe("If provided, resize image to this max width (preserving aspect)"),
+  maxHeight: z.number().int().positive().optional().describe("If provided, resize image to this max height (preserving aspect)"),
+  quality: z.number().int().min(1).max(100).optional().describe("JPEG/WebP quality (1-100)"),
+  outputFormat: z.enum(["auto", "jpeg", "png", "webp"]).optional().default("auto").describe("Optional output format; 'auto' preserves original where possible")
 });
 
 const ReadMultipleFilesArgsSchema = z.object({
@@ -245,16 +250,18 @@ server.registerTool(
   readTextFileHandler
 );
 
+// In the read_media_file handler, use sharp for images:
 server.registerTool(
   "read_media_file",
   {
     title: "Read Media File",
-    description:
-      "Read a file and return it as a base64-encoded content block with its MIME type. " +
-      "Image and audio files are returned as image/audio content; any other file type is " +
-      "returned as an embedded resource. Only works within allowed directories.",
+    description: "Read a file and return it as base64-encoded content with MIME type. Supports optional image resizing.",
     inputSchema: {
-      path: z.string()
+      path: z.string(),
+      maxWidth: z.number().optional(),
+      maxHeight: z.number().optional(),
+      quality: z.number().optional(),
+      outputFormat: z.enum(["auto", "jpeg", "png", "webp"]).optional()
     },
     outputSchema: {
       content: z.array(z.union([
@@ -267,7 +274,6 @@ server.registerTool(
           type: z.literal("resource"),
           resource: z.object({
             uri: z.string(),
-            // Optional, matching the SDK's BlobResourceContents shape (the handler always sets it).
             mimeType: z.string().optional(),
             blob: z.string()
           })
@@ -293,21 +299,59 @@ server.registerTool(
       ".flac": "audio/flac",
     };
     const mimeType = mimeTypes[extension] || "application/octet-stream";
-    const data = await readFileAsBase64Stream(validPath);
 
-    // Map the MIME type to a valid MCP content block. The spec only allows
-    // text, image, audio, resource_link, and resource — so non-image/audio
-    // binaries are returned as an embedded resource (NOT type:"blob", which the
-    // SDK content-block union rejects on schema validation).
+    // If it's an image and resize options provided, use sharp to resize/convert
+    if (mimeType.startsWith("image/")) {
+      const maxWidth = args.maxWidth;
+      const maxHeight = args.maxHeight;
+      const quality = args.quality ?? 80;
+      const preferFormat = args.outputFormat ?? "auto";
+
+      // Load into sharp, apply resize only if maxWidth/maxHeight provided
+      let pipeline = sharp(validPath, { failOnError: false });
+      if (maxWidth || maxHeight) {
+        pipeline = pipeline.resize({
+          width: maxWidth,
+          height: maxHeight,
+          fit: "inside", // preserve aspect ratio and fit inside the box
+          withoutEnlargement: true // don't enlarge small images
+        });
+      }
+
+      // Choose output format
+      let outBuffer: Buffer;
+      let outMime = mimeType;
+      if (preferFormat === "jpeg" || (preferFormat === "auto" && extension === ".jpg" || extension === ".jpeg")) {
+        outBuffer = await pipeline.jpeg({ quality }).toBuffer();
+        outMime = "image/jpeg";
+      } else if (preferFormat === "webp" || (preferFormat === "auto" && extension === ".webp")) {
+        outBuffer = await pipeline.webp({ quality }).toBuffer();
+        outMime = "image/webp";
+      } else if (preferFormat === "png" || (preferFormat === "auto" && extension === ".png")) {
+        // for PNG we ignore quality as PNG is lossless (can set compression level if desired)
+        outBuffer = await pipeline.png().toBuffer();
+        outMime = "image/png";
+      } else {
+        // fallback: keep original format where possible
+        outBuffer = await pipeline.toBuffer();
+      }
+
+      const data = outBuffer.toString("base64");
+      return {
+        content: [{ type: "image" as const, data, mimeType: outMime }],
+        structuredContent: { content: [{ type: "image", data, mimeType: outMime }] }
+      };
+    }
+
+    // Non-image (audio/other) — keep original behaviour: stream and base64
+    const data = await readFileAsBase64Stream(validPath);
     const contentItem =
-      mimeType.startsWith("image/")
-        ? { type: "image" as const, data, mimeType }
-        : mimeType.startsWith("audio/")
-          ? { type: "audio" as const, data, mimeType }
-          : {
-              type: "resource" as const,
-              resource: { uri: pathToFileURL(validPath).href, mimeType, blob: data }
-            };
+      mimeType.startsWith("audio/")
+        ? { type: "audio" as const, data, mimeType }
+        : {
+            type: "resource" as const,
+            resource: { uri: pathToFileURL(validPath).href, mimeType, blob: data }
+          };
     return {
       content: [contentItem],
       structuredContent: { content: [contentItem] }
