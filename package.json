@@ -22,7 +22,9 @@
     "@modelcontextprotocol/server-everything": "*",
     "@modelcontextprotocol/server-memory": "*",
     "@modelcontextprotocol/server-filesystem": "*",
-    "@modelcontextprotocol/server-sequential-thinking": "*"
+    "@modelcontextprotocol/server-sequential-thinking": "*",
+    "music-metadata": "^11.14.0",
+    "sharp": "^0.35.3"
   },
   "overrides": {
     "qs": ">=6.15.2",
