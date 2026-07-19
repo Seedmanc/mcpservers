@@ -7,6 +7,8 @@ import { createReadStream } from "fs";
 import path from "path";
 import { pathToFileURL } from "url";
 import { z } from "zod";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { minimatch } from "minimatch";
 import { normalizePath, expandHome } from './path-utils.js';
 import { getValidRootDirectories } from './roots-utils.js';
@@ -81,7 +83,8 @@ const ReadTextFileArgsSchema = z.object({
     head: z.number().optional().describe('If provided, returns only the first N lines of the file')
 });
 const ReadMediaFileArgsSchema = z.object({
-    path: z.string()
+    path: z.string(),
+    //prompt: z.string().optional().describe("Custom question to ask the vision model about the image. Defaults to a general description request.")
 });
 const ReadMultipleFilesArgsSchema = z.object({
     paths: z
@@ -196,27 +199,101 @@ server.registerTool("read_text_file", {
     outputSchema: { content: z.string() },
     annotations: { readOnlyHint: true, openWorldHint: false }
 }, readTextFileHandler);
-/*const literalSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+const execFileAsync = promisify(execFile);
 
-// 3. Define the recursive Zod schema using z.lazy
-export const jsonSchema  = z.lazy(() =>
-    z.union([literalSchema, z.array(jsonSchema), z.record(jsonSchema)])
-);*/
+let cachedLlamaServerBase = null;
+
+async function probeHealth(base) {
+    try {
+        const res = await fetch(`${base}/v1/health`, { signal: AbortSignal.timeout(1000) });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+async function discoverLlamaServerPort() {
+    try {
+        const  pidList  = await execFileAsync("wmic", ["process",'where', "name='msty-llama-server.exe'",'get','commandline']);
+		 
+        return pidList.stdout.split(/\r\n/gim).filter(el => el.includes('-mmproj'))[0].match(/--port (\d+)/)[1];
+    } catch (e) {
+        //throw new Error(JSON.stringify(e))
+    }
+
+    // Fallback: probe common/likely ports directly
+    const candidates = [8080, 8000, 8081, 3000, 5000, 8888, 53660, 62959,65129];
+    for (const p of candidates) {
+        if (await probeHealth(`http://127.0.0.1:${p}`)) return p;
+    }
+    throw new Error(
+        "Could not locate a running llama-server instance."
+    );
+}
+async function getLlamaServerBase(){
+    if (cachedLlamaServerBase && (await probeHealth(cachedLlamaServerBase))) {
+        return cachedLlamaServerBase;
+    }
+    const port = await discoverLlamaServerPort();
+    const base = `http://127.0.0.1:${port}`;
+    if (!(await probeHealth(base))) {
+        throw new Error(`Found llama-server on port ${port} but it isn't responding to /health.`);
+    }
+    cachedLlamaServerBase = base;
+    return base;
+}
+async function describeImageWithLlamaServer(
+    imageBuffer,
+    mimeType,
+    prompt = 'Describe the image concisely in natural language. Name the characters ONLY if you are very sure you recognise them with high confidence.'
+) {
+    const base = await getLlamaServerBase();
+    const dataUrl = `data:${mimeType};base64,${imageBuffer.toString("base64")}`;
+
+    const res = await fetch(`${base}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({
+            model: "local","temperature": 0.1,
+            max_tokens: 200,
+            "chat_template_kwargs": {
+                "enable_thinking": false
+            },
+            "reasoning_budget": 0,
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        { type: "text", text: prompt },
+                        { type: "image_url", image_url: { url: dataUrl } }
+                    ]
+                }
+            ]
+        })
+    });
+
+    if (!res.ok) {
+        throw new Error(`llama-server vision request failed: ${res.status} ${await res.text()}`);
+    }
+    const json = await res.json();
+    const text = json?.choices?.[0]?.message?.content;
+    if (!text) {
+        throw new Error("llama-server returned no description text.");
+    }
+    return text;
+}
+
 server.registerTool("read_media_file", {
     title: "Read Media File",
-    description: "Read a file and if it's an image, return it as a base64-encoded content block with its MIME type. " +
+    description: "Read a file and if it's an image, return a description. " +
         "Audio files return metadata such as ID3 tags; any other file type is " +
         "returned as an embedded resource. Only works within allowed directories.",
     inputSchema: {
-        path: z.string()
+        path: z.string(),
+        //prompt: z.string().optional().describe("Custom question to ask the vision model about the image. Defaults to a general description request.")
     },
     outputSchema: {
         content: z.array(z.union([
-        z.object({
-          type: z.literal("image"),
-          data: z.string(),
-          mimeType: z.string()
-        }),
         z.object({
           type: z.literal("text"),
           text: z.string()
@@ -255,53 +332,53 @@ server.registerTool("read_media_file", {
         ".wma": "audio/wma",
     };
     const mimeType = mimeTypes[extension] || 'n/a';
-            if (mimeType == 'n/a') {
-                let ci = {type: "text", text:  "No data, use the filename" };
-                return {content: [ci],structuredContent:{content:[ci]}};
+        if (mimeType == 'n/a') {
+            let ci = {type: "text", text:  "No data, use the filename" };
+            return {content: [ci],structuredContent:{content:[ci]}};
+        }
+        let temp = {};
+        if (mimeType.startsWith("image/")) {
+            let pipeline = sharp(validPath);
+            pipeline = pipeline.resize({
+                width: 512,
+                height: 512,
+                fit: "inside", // preserve aspect ratio and fit inside the box
+                withoutEnlargement: true // don't enlarge small images
+            });
+            let outBuffer = await pipeline.jpeg({ quality:85 }).toBuffer();
+            let outMime = "image/jpeg";
+            //let data = (outBuffer.toString("base64"));
+            const description =  await describeImageWithLlamaServer(outBuffer, outMime);//, prompt);
+            const contentItem = { type: "text", text: description };
+            return {
+                content: [contentItem],
+                structuredContent: { content: [contentItem] }
+            };
+        } else {
+         try {
+            let data;
+            if (!mimeType.startsWith("audio/"))
+                data = await readFileAsBase64Stream(validPath);
+            let text = ' ';
+            if (mimeType.startsWith("audio/")) {
+                  temp = await parseFile(validPath);
+                delete temp.common.picture;
+                text=  JSON.stringify(temp.common);
             }
-            let temp = {};
-			if (mimeType.startsWith("image/")) {
-				let pipeline = sharp(validPath);
-				pipeline = pipeline.resize({
-					width: 300,
-					height: 300,
-					fit: "inside", // preserve aspect ratio and fit inside the box
-					withoutEnlargement: true // don't enlarge small images
-				});
-				let outBuffer = await pipeline.jpeg({ quality:85 }).toBuffer();
-				let outMime = "image/jpeg";	
-				let data = (outBuffer.toString("base64"));
-				let contentItem ={ type: "image",   mimeType:outMime, data }
-				return {
-					content: [contentItem],
-					structuredContent: { content: [contentItem] }
-				};
-			} else {		
-			try {
-				let data;
-                if (!mimeType.startsWith("audio/"))
-                    data = await readFileAsBase64Stream(validPath);
-				let text = ' ';
-				if (mimeType.startsWith("audio/")) {
-					  temp = await parseFile(validPath);
-                    delete temp.common.picture;
-					text=  JSON.stringify(temp.common);
-				}
-				let contentItem = mimeType.startsWith("audio/")
-						? { type: "text",   text }
-						: {
-							type: "resource",
-							resource: { uri: pathToFileURL(validPath).href, mimeType, blob: data }
-						}; 
-				return {
-					content: [contentItem],
-					structuredContent: { content: [contentItem] }
-				};
-		} catch (e){console.log(e)
-			throw new Error(e)
-		}
-			}
-	
+            let contentItem = mimeType.startsWith("audio/")
+                    ? { type: "text",   text }
+                    : {
+                        type: "resource",
+                        resource: { uri: pathToFileURL(validPath).href, mimeType, blob: data }
+                    };
+            return {
+                content: [contentItem],
+                structuredContent: { content: [contentItem] }
+            };
+         } catch (e){console.log(e)
+            throw new Error(e)
+        }
+  }
 });
 server.registerTool("read_multiple_files", {
     title: "Read Multiple Files",
